@@ -1,9 +1,11 @@
 from transformer import Transformer
 from tiktoken import get_encoding
+from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
 import torch
 import numpy as np
 import time
+import math
 
 tk = get_encoding('gpt2')
 
@@ -14,7 +16,10 @@ seq_len = 192
 n_layers = 8
 n_heads = 8
 vocab_size = tk.n_vocab
-training_steps = 150000
+lr_max = 8e-5
+
+training_steps = 50000
+warmup_steps = training_steps * 0.05
 dataset_path = 'E:/datasets/AOT/dataset.bin'
 
 CONTINUE = False
@@ -43,13 +48,23 @@ class Dataset:
         y_batch = torch.from_numpy(np.array(y_batch, dtype=np.uint16)).long()
 
         return x_batch, y_batch
-    
+
+# ---- LEARNING RATE SCHEDULER ----
+def get_lr(step):
+    if step < warmup_steps:
+        return step / warmup_steps
+    else:
+        progress = (step - warmup_steps) / (training_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(torch.pi * progress))
+
 
 # ------ ИНИЦИАЛИЗАЦИЯ ------
 model = Transformer(vocab_size, d_model, n_layers, n_heads).cuda()
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=0.1)
+scheduler = LambdaLR(optimizer, get_lr)
 scaler = torch.amp.GradScaler()
-start_step = 0
+start_step = 1
+
 
 if CONTINUE:
     ckpt = torch.load("E:/AOT/checkpoint.pt")
@@ -68,7 +83,7 @@ def main():
     
     for step in range(start_step, training_steps+1):
         t0 = time.time()
-        
+
         x, y = ds.get_batch(batch_size)
         x = x.cuda(non_blocking=True)
         y = y.cuda(non_blocking=True)
@@ -86,6 +101,7 @@ def main():
         
         scaler.scale(loss).backward()
         scaler.step(optimizer)
+        scheduler.step()
         scaler.update()
 
         t1 = time.time()
@@ -93,11 +109,12 @@ def main():
         # Выводим лосс каждые 100 шагов
         if step % 100 == 0:
             print('-----------------------------')
-            print(f"Step {step}: loss={loss.item()}")
-            print("Step time:", t1 - t0)
+            print(f"Step {step}: loss={loss.item():.3f}")
+            print(f"Step time: {(t1-t0):.2f}s")
+            print(f"Learning rate: {scheduler.get_last_lr()[0]}")
 
         # Генерируем ответ каждые 500 шагов
-        if step % 500 == 0 and step > 0:
+        if step % 1000 == 0 and step > 0:
             prompt = torch.tensor([[50256]], dtype=torch.long).cuda()
             out = model.generate(prompt, max_new_tokens=50).tolist()
             print(tk.decode(out[0]))
