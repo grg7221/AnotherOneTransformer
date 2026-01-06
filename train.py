@@ -1,11 +1,13 @@
-from transformer import Transformer
-from tiktoken import get_encoding
+import torch
 from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
-import torch
+from transformer import Transformer
+import metrics
+from tiktoken import get_encoding
 import numpy as np
 import time
 import math
+import csv
 
 tk = get_encoding('gpt2')
 
@@ -64,7 +66,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=0.1)
 scheduler = LambdaLR(optimizer, get_lr)
 scaler = torch.amp.GradScaler()
 start_step = 1
-
+ema_loss = 0
 
 if CONTINUE:
     ckpt = torch.load("E:/AOT/checkpoint.pt")
@@ -73,10 +75,16 @@ if CONTINUE:
     scaler.load_state_dict(ckpt['scaler'])
     start_step = ckpt['step']
 
+if not CONTINUE:
+    with open('train_metrics.csv', mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['step', 'loss', 'ema_loss', 'lr', 'ppl', 'grad_norm'])
+
 # --------- ОБУЧЕНИЕ ----------
 def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
+
     ds = Dataset(dataset_path, seq_len)
     print(f"Total tokens in dataset: {len(ds)}")
     model.train()
@@ -106,28 +114,23 @@ def main():
 
         t1 = time.time()
 
-        # Выводим лосс каждые 100 шагов
-        if step % 100 == 0:
-            print('-----------------------------')
-            print(f"Step {step}: loss={loss.item():.3f}")
-            print(f"Step time: {(t1-t0):.2f}s")
-            print(f"Learning rate: {scheduler.get_last_lr()[0]}")
+        if step == 1:
+            ema_loss = loss.item()
+        else:
+            ema_loss = 0.01 * loss.item() + (1 - 0.01) * ema_loss
 
-        # Генерируем ответ каждые 500 шагов
-        if step % 1000 == 0 and step > 0:
-            prompt = torch.tensor([[50256]], dtype=torch.long).cuda()
-            out = model.generate(prompt, max_new_tokens=50).tolist()
-            print(tk.decode(out[0]))
-            model.train()
+        metrics.get_metrics(
+        {
+            "step": step,
+            "model": model,
+            "t": t1-t0,
+            "lr": scheduler.get_last_lr()[0],
+            "loss": loss.item(),
+            "ema_loss": ema_loss,
+            "optimizer": optimizer,
+            "scaler": scaler
+        })
 
-        # Сохраняем промежуточное состояние каждые 5000 шагов
-        if step % 5000 == 0 and step > 0:
-            torch.save({
-                'step': step,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict()
-            }, f"E:/AOT/checkpoint.pt")
 
 if __name__ == "__main__":
     main()
